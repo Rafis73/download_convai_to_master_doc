@@ -1,28 +1,25 @@
-name: ConvAI Calls to Master Doc (Every 5 minutes)
+name: ConvAI → Master Doc ( каждые 5 минут )
 
 on:
   schedule:
     - cron: '*/5 * * * *'
 
 jobs:
-  convai_to_master_doc:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v3
+      - uses: actions/setup-python@v3
         with:
-          python-version: '3.10'
+          python-version: '3.x'
 
-      - name: Install dependencies
-        run: pip install google-api-python-client google-auth google-auth-oauthlib requests
+      - run: pip install google-api-python-client google-auth-oauthlib requests
 
-      - name: Export secrets to env
+      - name: Экспорт секретов
         run: |
           echo "MASTER_DOC_ID=${{ secrets.MASTER_DOC_ID }}" >> $GITHUB_ENV
           echo "TZ_OFFSET_HOURS=${{ secrets.TZ_OFFSET_HOURS }}" >> $GITHUB_ENV
 
-      - name: Run ConvAI download script
+      - name: Запустить скрипт
         run: python download_convai_to_master_doc.py
