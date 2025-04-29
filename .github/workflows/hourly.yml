@@ -1,22 +1,25 @@
 name: ConvAI → Google Docs
 
 on:
-  # запуск каждые 5 минут
   schedule:
-    - cron: '*/5 * * * *'
-  # ручной запуск из UI GitHub Actions
-  workflow_dispatch:
+    - cron: '*/5 * * * *'    # каждые 5 минут по UTC
+  workflow_dispatch:        # ручной запуск из UI
 
 jobs:
   update-doc:
     runs-on: ubuntu-latest
+    env:
+      MASTER_DOC_ID: ${{ secrets.MASTER_DOC_ID }}
+      TZ_OFFSET_HOURS: ${{ secrets.TZ_OFFSET_HOURS }}
     steps:
       - uses: actions/checkout@v3
+
       - name: Установить Python и зависимости
         run: |
           python3 -m venv venv
           . venv/bin/activate
           pip install requests google-api-python-client google-auth google-auth-oauthlib
+
       - name: Запустить скрипт
         run: |
           . venv/bin/activate
