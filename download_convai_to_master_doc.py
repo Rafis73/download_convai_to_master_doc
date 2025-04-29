@@ -6,163 +6,144 @@ import sys
 import socket
 import requests
 import pickle
-from socket import timeout as SocketTimeout
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ----------------- Глобальный таймаут сокетов -----------------
-socket.setdefaulttimeout(60)  # 60 секунд по умолчанию для всех операций чтения
+# ————— Глобальный таймаут —————
+socket.setdefaulttimeout(60)
 
-# ----------------- НАСТРОЙКИ -----------------
-API_KEY        = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
-PAGE_SIZE      = 100
-MIN_DURATION   = 60  # секунды
-SINCE          = int(datetime.datetime(2025, 4, 1, 0, 0).timestamp())
-LAST_RUN_FILE  = "last_run.txt"
-CREDENTIALS    = "credentials.json"
-SCOPES         = ["https://www.googleapis.com/auth/documents"]
-TZ_OFFSET      = int(os.environ.get("TZ_OFFSET_HOURS", "0"))
+# ————— Конфиг —————
+API_KEY       = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
+PAGE_SIZE     = 100
+MIN_DURATION  = 60  # сек
+SINCE_EPOCH   = int(datetime.datetime(2025,4,1).timestamp())
+CREDENTIALS   = "credentials.json"
+SCOPES        = ["https://www.googleapis.com/auth/documents"]
+TZ_OFFSET_H   = int(os.getenv("TZ_OFFSET_HOURS","0"))
 
-# ----------------- Google OAuth -----------------
-def get_credentials():
+# ————— Google OAuth —————
+def get_creds():
     creds = None
     if os.path.exists("token.pickle"):
-        creds = pickle.load(open("token.pickle", "rb"))
+        creds = pickle.load(open("token.pickle","rb"))
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
             creds = flow.run_local_server(port=0, access_type="offline")
-        pickle.dump(creds, open("token.pickle", "wb"))
+        pickle.dump(creds, open("token.pickle","wb"))
     return creds
 
-creds = get_credentials()
-docs_service = build("docs", "v1", credentials=creds)
+creds = get_creds()
+docs_svc = build("docs","v1",credentials=creds)
 
-# ----------------- ConvAI API -----------------
-session = requests.Session()
-session.trust_env = False
-session.headers.update({"xi-api-key": API_KEY, "Accept": "application/json"})
+# ————— ConvAI API —————
+sess = requests.Session()
+sess.trust_env = False
+sess.headers.update({"xi-api-key":API_KEY,"Accept":"application/json"})
 
 def fetch_all_calls():
-    url = "https://api.elevenlabs.io/v1/convai/conversations"
-    params = {"page_size": PAGE_SIZE}
-    all_calls = []
+    url="https://api.elevenlabs.io/v1/convai/conversations"
+    params={"page_size":PAGE_SIZE}
+    out=[]
     while True:
-        try:
-            r = session.get(url, params=params, timeout=30)
-            r.raise_for_status()
-        except (requests.exceptions.ReadTimeout, SocketTimeout):
-            print("⚠️ Таймаут при получении списка звонков, прерываюся.")
-            sys.exit(1)
-        data = r.json()
-        all_calls.extend(data.get("conversations", []))
-        if not data.get("has_more", False):
-            break
-        params["cursor"] = data["next_cursor"]
-    return all_calls
+        r=sess.get(url,params=params,timeout=30); r.raise_for_status()
+        j=r.json()
+        out+=j.get("conversations",[])
+        if not j.get("has_more",False): break
+        params["cursor"]=j["next_cursor"]
+    return out
 
-def fetch_call_detail(cid):
-    url = f"https://api.elevenlabs.io/v1/convai/conversations/{cid}"
-    try:
-        r = session.get(url, timeout=30)
-        r.raise_for_status()
-    except (requests.exceptions.ReadTimeout, SocketTimeout):
-        print(f"⚠️ Таймаут при получении деталей звонка {cid}, пропускаю.")
-        return {}
+def fetch_detail(cid):
+    url=f"https://api.elevenlabs.io/v1/convai/conversations/{cid}"
+    r=sess.get(url,timeout=30); r.raise_for_status()
     return r.json()
 
-# ----------------- Вспомогалки -----------------
-def load_last_run():
-    if os.path.exists(LAST_RUN_FILE):
-        return int(open(LAST_RUN_FILE).read().strip())
-    return 0
+# ————— Парсим последний заголовок из документа —————
+def get_last_run_from_doc(doc_id):
+    doc = docs_svc.documents().get(documentId=doc_id).execute()
+    content = doc.get("body",{}).get("content",[])
+    last_ts = SINCE_EPOCH
+    for elem in content:
+        para = elem.get("paragraph",{})
+        text=""
+        for el in para.get("elements",[]):
+            tr = el.get("textRun",{})
+            text += tr.get("content","")
+        if text.startswith("=== Call at "):
+            # формат: === Call at YYYY-MM-DD HH:MM:SS ===\n
+            ts_str = text[len("=== Call at "):].split(" ===")[0]
+            try:
+                dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                # получить UTC-epoch: убрать смещение часов
+                epoch = int(time.mktime(dt.timetuple())) - TZ_OFFSET_H*3600
+                if epoch>last_ts: last_ts=epoch
+            except:
+                pass
+    return last_ts
 
-def save_last_run(ts):
-    with open(LAST_RUN_FILE, "w") as f:
-        f.write(str(int(ts)))
-
-# ----------------- Формат звонка -----------------
-def format_call(detail, fallback_ts):
-    st = detail.get("metadata", {}).get("start_time_unix_secs", fallback_ts)
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(st + TZ_OFFSET*3600))
-    summ = detail.get("analysis", {}).get("transcript_summary", "").strip()
-    transcript = detail.get("transcript", [])
-    lines, prev = [], None
-    for m in transcript:
-        role = (m.get("role") or "").upper()
-        txt  = (m.get("message") or "").strip()
-        if not txt:
-            continue
-        sec = m.get("time_in_call_secs", 0.0)
-        line = f"[{sec:06.2f}s] {role}: {txt}"
-        if prev and prev != role:
-            lines.append("")
-        if prev == role:
-            lines[-1] += "\n" + line
+# ————— Формат одного звонка —————
+def format_call(d, fallback):
+    st = d.get("metadata",{}).get("start_time_unix_secs",fallback)
+    dt = time.gmtime(st + TZ_OFFSET_H*3600)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", dt)
+    summ = d.get("analysis",{}).get("transcript_summary","").strip()
+    lines=[]
+    prev=None
+    for m in d.get("transcript",[]):
+        role=(m.get("role") or "").upper()
+        txt=(m.get("message") or "").strip()
+        if not txt: continue
+        sec=m.get("time_in_call_secs",0.0)
+        line=f"[{sec:06.2f}s] {role}: {txt}"
+        if prev and prev!=role: lines.append("")
+        if prev==role:
+            lines[-1]+="\n"+line
         else:
             lines.append(line)
-        prev = role
+        prev=role
+    hdr=f"=== Call at {ts} ===\n"
+    if summ: hdr+=f"Summary:\n{summ}\n"
+    return hdr+"\n"+"\n".join(lines)+"\n\n"+"―"*40+"\n\n"
 
-    header = f"=== Call at {ts} ===\n"
-    if summ:
-        header += f"Summary:\n{summ}\n"
-    return header + "\n" + "\n".join(lines) + "\n\n" + "―"*40 + "\n\n"
-
-# ----------------- Основной Flow -----------------
+# ————— Main —————
 def main():
-    doc_id = os.environ.get("MASTER_DOC_ID")
+    doc_id=os.getenv("MASTER_DOC_ID")
     if not doc_id:
-        print("❌ Ошибка: переменная MASTER_DOC_ID не установлена.")
+        print("❌ Переменная MASTER_DOC_ID не установлена!")
         sys.exit(1)
+
+    last_ts = get_last_run_from_doc(doc_id)
 
     calls = fetch_all_calls()
     sel   = [c for c in calls
-             if c.get("start_time_unix_secs", 0) >= SINCE
-             and c.get("call_duration_secs", 0) > MIN_DURATION]
-    last  = load_last_run()
-    new   = [c for c in sel if c["start_time_unix_secs"] > last]
+             if c.get("start_time_unix_secs",0)>=SINCE_EPOCH
+             and c.get("call_duration_secs",0)>MIN_DURATION]
+    new   = [c for c in sel if c["start_time_unix_secs"]>last_ts]
     if not new:
         print("🔍 Нет новых звонков.")
         return
 
-    # сортируем старые сначала, чтобы новые шли по очереди
-    new.sort(key=lambda x: x["start_time_unix_secs"])
-    full_text, max_ts = "", last
-
+    new.sort(key=lambda x:x["start_time_unix_secs"])
+    full=""
+    max_ts=last_ts
     for c in new:
-        detail = fetch_call_detail(c["conversation_id"])
-        if not detail:
-            continue
-        full_text += format_call(detail, c["start_time_unix_secs"])
-        st = detail.get("metadata", {}).get("start_time_unix_secs", 0)
-        if st > max_ts:
-            max_ts = st
+        d=fetch_detail(c["conversation_id"])
+        full+=format_call(d,c["start_time_unix_secs"])
+        st=d.get("metadata",{}).get("start_time_unix_secs",0)
+        if st>max_ts: max_ts=st
 
-    # Вставляем в конец документа через endOfSegmentLocation
-    requests_body = [
-        {
-            "insertText": {
-                "endOfSegmentLocation": {},
-                "text": full_text
-            }
-        }
-    ]
-
+    reqs=[{"insertText":{"endOfSegmentLocation":{},"text":full}}]
     try:
-        docs_service.documents().batchUpdate(
-            documentId=doc_id,
-            body={"requests": requests_body}
-        ).execute()
-    except (HttpError, SocketTimeout) as e:
-        print("❌ Ошибка при обновлении документа:", e)
+        docs_svc.documents().batchUpdate(documentId=doc_id,body={"requests":reqs}).execute()
+    except HttpError as e:
+        print("❌ Ошибка batchUpdate:",e)
         sys.exit(1)
 
-    save_last_run(max_ts)
-    print(f"✅ Добавлено {len(new)} звонков в документ {doc_id}.")
+    print(f"✅ Добавлено {len(new)} звонков. Последний ts={max_ts}")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
