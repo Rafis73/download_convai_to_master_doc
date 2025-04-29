@@ -2,21 +2,25 @@
 # download_convai_to_master_doc.py
 
 import os
-import re
+import time
+import datetime
 import requests
 import pickle
-from datetime import datetime, timedelta
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # ----------------- НАСТРОЙКИ -----------------
-API_KEY         = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
-PAGE_SIZE       = 100
-MIN_DURATION    = 60
-SINCE           = int(datetime(2025, 4, 1).timestamp())
-CREDENTIALS     = "credentials.json"
-SCOPES          = [
+API_KEY        = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
+PAGE_SIZE      = 100
+MIN_DURATION   = 60      # секунды
+# С какого момента брать звонки (1 апреля 2025)
+SINCE          = int(datetime.datetime(2025, 4, 1, 0, 0).timestamp())
+DOC_ID_FILE    = "doc_id.txt"
+LAST_RUN_FILE  = "last_run.txt"
+CREDENTIALS    = "credentials.json"
+SCOPES         = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
 ]
@@ -24,22 +28,26 @@ SCOPES          = [
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "4"))
 
 # ----------------- Google OAuth -----------------
-def get_google_services():
+def get_credentials():
     creds = None
     if os.path.exists("token.pickle"):
-        creds = pickle.load(open("token.pickle","rb"))
+        with open("token.pickle", "rb") as f:
+            creds = pickle.load(f)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
-            creds = flow.run_local_server(port=0, access_type="offline")
-        pickle.dump(creds, open("token.pickle","wb"))
-    docs_svc  = build("docs","v1",credentials=creds)
-    drive_svc = build("drive","v3",credentials=creds)
-    return docs_svc, drive_svc
+            creds = flow.run_local_server(port=0,
+                                          access_type="offline",
+                                          include_granted_scopes=True)
+        with open("token.pickle", "wb") as f:
+            pickle.dump(creds, f)
+    return creds
 
-docs_service, drive_service = get_google_services()
+creds = get_credentials()
+docs_service  = build("docs", "v1", credentials=creds)
+drive_service = build("drive", "v3", credentials=creds)
 
 # ----------------- ConvAI API -----------------
 session = requests.Session()
@@ -50,122 +58,174 @@ session.headers.update({
 })
 
 def fetch_all_calls():
-    url, params, out = "https://api.elevenlabs.io/v1/convai/conversations", {"page_size": PAGE_SIZE}, []
+    url, params = (
+        "https://api.elevenlabs.io/v1/convai/conversations",
+        {"page_size": PAGE_SIZE},
+    )
+    all_calls = []
     while True:
         r = session.get(url, params=params); r.raise_for_status()
         j = r.json()
-        out.extend(j.get("conversations",[]))
-        if not j.get("has_more", False): break
+        all_calls.extend(j.get("conversations", []))
+        if not j.get("has_more", False):
+            break
         params["cursor"] = j["next_cursor"]
-    return out
+    return all_calls
 
 def fetch_call_detail(cid):
     r = session.get(f"https://api.elevenlabs.io/v1/convai/conversations/{cid}")
     r.raise_for_status()
     return r.json()
 
-# ----------------- DOC ID -----------------
-def get_doc_id():
-    # Сначала из Secrets
-    env = os.getenv("MASTER_DOC_ID")
-    if env:
-        return env
-    # Иначе спрашиваем у пользователя (первый раз)
-    print("MASTER_DOC_ID не задан. Будет создан новый документ.")
-    file = drive_service.files().create(
-        body={"name":"ConvAI_Master_Log","mimeType":"application/vnd.google-apps.document"},
-        fields="id"
-    ).execute()
-    doc_id = file["id"]
-    print("Новый документ создан, его ID =", doc_id)
-    print("Скопируйте этот ID в Secrets → MASTER_DOC_ID и перезапустите скрипт.")
-    exit(0)
+# ----------------- Вспомогалки -----------------
+def load_last_run():
+    if os.path.exists(LAST_RUN_FILE):
+        return int(open(LAST_RUN_FILE).read().strip())
+    return 0
 
-# ----------------- Читаем последний timestamp из документа -----------------
-def load_last_from_doc(doc_id):
-    doc = docs_service.documents().get(documentId=doc_id).execute()
-    text = ""
-    for elem in doc.get("body",{}).get("content",[]):
-        if "paragraph" not in elem: 
-            continue
-        for run in elem["paragraph"].get("elements",[]):
-            txt = run.get("textRun",{}).get("content","")
-            text += txt
-    # ищем все строки === Call at YYYY-MM-DD HH:MM:SS ===
-    matches = re.findall(r"=== Call at ([0-9\-: ]{19}) ===", text)
-    if not matches:
-        return SINCE  # если ещё нет ни одного блока
-    # самый первый match — самый старый, мы хотят последний (самый свежий)
-    last_ts_str = matches[-1]
-    dt = datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S")
-    # конвертим обратно в UTC
-    dt_utc = dt - timedelta(hours=TZ_OFFSET_HOURS)
-    return int(dt_utc.timestamp())
+def save_last_run(ts):
+    with open(LAST_RUN_FILE, "w") as f:
+        f.write(str(int(ts)))
+
+def load_doc_id():
+    if os.path.exists(DOC_ID_FILE):
+        return open(DOC_ID_FILE).read().strip()
+    return None
+
+def save_doc_id(did):
+    with open(DOC_ID_FILE, "w") as f:
+        f.write(did)
+
+def create_master_doc():
+    meta = {
+        "name":     "ConvAI_Master_Log",
+        "mimeType": "application/vnd.google-apps.document"
+    }
+    file = drive_service.files().create(body=meta, fields="id").execute()
+    return file["id"]
 
 # ----------------- Формат звонка -----------------
 def format_call(detail, fallback_ts):
-    st = detail.get("metadata",{}).get("start_time_unix_secs", fallback_ts)
-    dt = datetime.utcfromtimestamp(st) + timedelta(hours=TZ_OFFSET_HOURS)
+    st = detail.get("metadata", {}).get("start_time_unix_secs", fallback_ts)
+    dt = datetime.datetime.utcfromtimestamp(st) + datetime.timedelta(hours=TZ_OFFSET_HOURS)
     ts = dt.strftime("%Y-%m-%d %H:%M:%S")
-    summ = detail.get("analysis",{}).get("transcript_summary","").strip()
-    transcript = detail.get("transcript",[])
-    lines, prev = [], None
+    summ = detail.get("analysis", {}).get("transcript_summary", "").strip()
+    transcript = detail.get("transcript", [])
+    lines = []
+    prev = None
+
     for m in transcript:
         role = (m.get("role") or "").upper()
         txt  = (m.get("message") or "").strip()
-        if not txt: continue
-        sec = m.get("time_in_call_secs",0.0)
-        prefix = f"[{sec:06.2f}s] {role}: "
-        if role == prev:
-            lines[-1] += "\n" + prefix + txt
+        if not txt:
+            continue
+        tsec = m.get("time_in_call_secs", 0.0)
+        line = f"[{tsec:06.2f}s] {role}: {txt}"
+        if prev and prev != role:
+            lines.append("")  # разделитель между ролями
+        if prev == role:
+            lines[-1] += "\n" + line
         else:
-            if prev and prev != role: lines.append("")
-            lines.append(prefix + txt)
+            lines.append(line)
         prev = role
+
     header = f"=== Call at {ts} ===\n"
-    if summ: header += f"Summary:\n{summ}\n"
+    if summ:
+        header += f"Summary:\n{summ}\n"
     body = "\n".join(lines)
-    return header + "\n" + body + "\n\n" + "―"*40 + "\n\n"
+    return header + "\n" + body + "\n\n" + "―" * 40 + "\n\n"
 
-# ----------------- MAIN -----------------
+# ----------------- Основной Flow -----------------
 def main():
-    doc_id = get_doc_id()
+    # 1) master-doc
+    doc_id = load_doc_id() or create_master_doc()
+    save_doc_id(doc_id)
 
-    # Узнаём последний сохранённый timestamp
-    last_ts = load_last_from_doc(doc_id)
-
-    # Берём все звонки
+    # 2) загрузка всех звонков
     calls = fetch_all_calls()
-    sel   = [
+
+    # 3) фильтрация: с SINCE и дольше MIN_DURATION
+    sel = [
         c for c in calls
-        if c.get("start_time_unix_secs",0) >= SINCE
-        and c.get("call_duration_secs",0) > MIN_DURATION
+        if c.get("start_time_unix_secs", 0) >= SINCE
+        and c.get("call_duration_secs", 0) > MIN_DURATION
     ]
-    # Оставляем только новые
-    new_calls = [c for c in sel if c["start_time_unix_secs"] > last_ts]
+
+    # 4) только новые после last_run
+    last_ts = load_last_run()
+    new_calls = [
+        c for c in sel
+        if c.get("start_time_unix_secs", 0) > last_ts
+    ]
     if not new_calls:
-        print("Новых звонков нет.")
+        print("Нет новых звонков для добавления.")
         return
 
-    # Сортируем: последний звонок первым
-    new_calls.sort(key=lambda x:x["start_time_unix_secs"], reverse=True)
+    # 5) сортировка (свежие первыми)
+    new_calls.sort(key=lambda x: x["start_time_unix_secs"], reverse=True)
 
-    # Формируем текст
+    # 6) формируем full_text и обновляем max_ts
     full_text = ""
+    max_ts = last_ts
     for c in new_calls:
-        block = format_call(fetch_call_detail(c["conversation_id"]), c["start_time_unix_secs"])
+        detail = fetch_call_detail(c["conversation_id"])
+        block  = format_call(detail, c.get("start_time_unix_secs", 0))
         full_text += block
+        st_call = detail.get("metadata", {}).get("start_time_unix_secs", 0)
+        if st_call > max_ts:
+            max_ts = st_call
 
-    # Вставляем в начало документа ровно как на локале
-    requests = [{
+    # 7) вставка и раскраска
+    # сначала узнаём endIndex, чтобы не падать на пустом документе
+    doc = docs_service.documents().get(documentId=doc_id).execute()
+    end_index = doc["body"]["content"][-1]["endIndex"]
+
+    # если документ не пуст (end_index>1) — вставляем наверх, иначе в конец
+    insert_index = 1 if end_index > 1 else end_index
+
+    requests_body = [{
         "insertText": {
-            "location": {"index": 1},
+            "location": {"index": insert_index},
             "text": full_text
         }
     }]
-    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
 
-    print(f"Добавлено {len(new_calls)} новых звонков.")
+    offset = insert_index
+    pos = 0
+    color_map = {
+        "AGENT": {"red": 0.0, "green": 0.5, "blue": 0.0},
+        "USER":  {"red": 0.0, "green": 0.0, "blue": 0.8},
+    }
+
+    for line in full_text.splitlines(True):
+        stripped = line.rstrip("\n")
+        if stripped.startswith("[") and ":" in stripped:
+            colon = stripped.find(":", stripped.find("]")+1)
+            if colon != -1:
+                start_idx = offset + pos
+                end_idx   = start_idx + colon + 1
+                role = "AGENT" if "AGENT" in stripped[:colon] else "USER"
+                requests_body.append({
+                    "updateTextStyle": {
+                        "range": {"startIndex": start_idx, "endIndex": end_idx},
+                        "textStyle": {
+                            "foregroundColor": {
+                                "color": {"rgbColor": color_map[role]}
+                            }
+                        },
+                        "fields": "foregroundColor"
+                    }
+                })
+        pos += len(line)
+
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={"requests": requests_body}
+    ).execute()
+
+    # 8) сохранение last_run
+    save_last_run(max_ts)
+    print(f"Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
 
 if __name__ == "__main__":
     main()
