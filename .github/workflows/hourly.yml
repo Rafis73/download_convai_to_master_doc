@@ -1,25 +1,42 @@
-name: ConvAI → Master Doc ( каждые 5 минут )
+name: ConvAI → Master Doc (каждые 5 минут)
 
 on:
   schedule:
     - cron: '*/5 * * * *'
 
 jobs:
-  run:
+  convai:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true  # чтобы push работал
+          fetch-depth: 0            # полный history для пуша
 
-      - uses: actions/setup-python@v3
+      - name: Set up Python
+        uses: actions/setup-python@v3
         with:
           python-version: '3.x'
 
-      - run: pip install google-api-python-client google-auth-oauthlib requests
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-oauthlib requests
 
-      - name: Экспорт секретов
+      - name: Export secrets
         run: |
           echo "MASTER_DOC_ID=${{ secrets.MASTER_DOC_ID }}" >> $GITHUB_ENV
-          echo "TZ_OFFSET_HOURS=${{ secrets.TZ_OFFSET_HOURS }}" >> $GITHUB_ENV
 
-      - name: Запустить скрипт
+      - name: Run script
         run: python download_convai_to_master_doc.py
+
+      - name: Commit updated last_run.txt
+        run: |
+          if [[ -n "$(git status --porcelain last_run.txt)" ]]; then
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add last_run.txt
+            git commit -m "chore: update last_run.txt [skip ci]"
+            git push
+          else
+            echo "last_run.txt не изменился — пуш не нужен."
+          fi
