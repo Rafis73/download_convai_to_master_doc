@@ -15,6 +15,7 @@ from googleapiclient.errors import HttpError
 API_KEY       = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
 PAGE_SIZE     = 100
 MIN_DURATION  = 60      # секунды
+# С какой даты брать звонки (1 апреля 2025)
 SINCE         = int(datetime(2025, 4, 1, 0, 0).timestamp())
 DOC_ID_FILE   = "doc_id.txt"
 LAST_RUN_FILE = "last_run.txt"
@@ -37,7 +38,9 @@ def get_credentials():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
-            creds = flow.run_local_server(port=0, access_type="offline", include_granted_scopes=True)
+            creds = flow.run_local_server(
+                port=0, access_type="offline", include_granted_scopes=True
+            )
         with open("token.pickle", "wb") as f:
             pickle.dump(creds, f)
     return creds
@@ -48,10 +51,8 @@ drive_service = build("drive", "v3", credentials=creds)
 
 # ----------------- ConvAI API (ElevenLabs) -----------------
 session = requests.Session()
-# Отключаем чтение HTTP_PROXY/HTTPS_PROXY из окружения,
-# чтобы не попадали в заголовки неподдерживаемые символы
+# Отключаем чтение HTTP(S)_PROXY из окружения, чтобы не было ошибок кодировки
 session.trust_env = False
-
 session.headers.update({
     "xi-api-key": API_KEY,
     "Accept":     "application/json"
@@ -60,8 +61,7 @@ session.headers.update({
 def fetch_all_calls():
     url, params, out = "https://api.elevenlabs.io/v1/convai/conversations", {"page_size": PAGE_SIZE}, []
     while True:
-        r = session.get(url, params=params)
-        r.raise_for_status()
+        r = session.get(url, params=params); r.raise_for_status()
         j = r.json()
         out += j.get("conversations", [])
         if not j.get("has_more", False):
@@ -85,7 +85,7 @@ def save_last_run(ts):
         f.write(str(int(ts)))
 
 def load_doc_id():
-    # Сначала пробуем из GitHub Secrets (через переменную окружения MASTER_DOC_ID)
+    # Сначала из переменной окружения (GitHub Secrets)
     env = os.getenv("MASTER_DOC_ID")
     if env:
         return env
@@ -95,18 +95,21 @@ def load_doc_id():
     return None
 
 def save_doc_id(did):
-    # Если мы используем MASTER_DOC_ID из окружения — не перезаписываем файл
+    # Если MASTER_DOC_ID задан — не трогаем файл
     if os.getenv("MASTER_DOC_ID"):
         return
     with open(DOC_ID_FILE, "w") as f:
         f.write(did)
 
 def create_master_doc():
-    meta = {"name": "ConvAI_Master_Log", "mimeType": "application/vnd.google-apps.document"}
+    meta = {
+        "name":     "ConvAI_Master_Log",
+        "mimeType": "application/vnd.google-apps.document"
+    }
     file = drive_service.files().create(body=meta, fields="id").execute()
     return file["id"]
 
-# ----------------- Форматирование одного звонка -----------------
+# ----------------- Форматирование звонка -----------------
 def format_call(detail, fallback_ts):
     st = detail.get("metadata", {}).get("start_time_unix_secs", fallback_ts)
     dt = datetime.utcfromtimestamp(st) + timedelta(hours=TZ_OFFSET_HOURS)
@@ -136,33 +139,33 @@ def format_call(detail, fallback_ts):
     body = "\n".join(lines)
     return header + "\n" + body + "\n\n" + "―" * 40 + "\n\n"
 
-# ----------------- Основной рабочий поток -----------------
+# ----------------- Основной flow -----------------
 def main():
-    # 1) Получаем или создаём документ
+    # 1) Получаем или создаём Google Doc
     doc_id = load_doc_id() or create_master_doc()
     save_doc_id(doc_id)
 
-    # 2) Загружаем все доступные звонки
+    # 2) Забираем все звонки
     calls = fetch_all_calls()
 
-    # 3) Фильтруем по дате (SINCE) и длительности (MIN_DURATION)
+    # 3) Фильтруем по дате и длительности
     sel = [
         c for c in calls
         if c.get("start_time_unix_secs", 0) >= SINCE
         and c.get("call_duration_secs", 0) > MIN_DURATION
     ]
 
-    # 4) Оставляем только новые после последнего запуска
+    # 4) Оставляем только новые после last_run
     last_ts = load_last_run()
     new_calls = [c for c in sel if c["start_time_unix_secs"] > last_ts]
     if not new_calls:
         print("Нет новых звонков для добавления.")
         return
 
-    # 5) Сортируем по убыванию времени
+    # 5) Сортируем свежие первыми
     new_calls.sort(key=lambda x: x["start_time_unix_secs"], reverse=True)
 
-    # 6) Формируем единый текст для вставки и запоминаем max_ts
+    # 6) Собираем текст и обновляем max_ts
     full_text = ""
     max_ts = last_ts
     for c in new_calls:
@@ -172,19 +175,38 @@ def main():
         if st_call > max_ts:
             max_ts = st_call
 
-    # 7) Делаем batchUpdate только с insertText
-    requests_body = [
-        {"insertText": {"location": {"index": 1}, "text": full_text}}
-    ]
+    # 7) Вставка: сначала надеемся на index=1, иначе fallback на конец
     try:
+        # узнаём длину документа
+        doc = docs_service.documents().get(documentId=doc_id).execute()
+        end_index = doc["body"]["content"][-1]["endIndex"]
+
+        # попытка вставить наверх
+        requests_body = [{
+            "insertText": {"location": {"index": 1}, "text": full_text}
+        }]
         docs_service.documents().batchUpdate(
-            documentId=doc_id,
-            body={"requests": requests_body}
+            documentId=doc_id, body={"requests": requests_body}
         ).execute()
-        save_last_run(max_ts)
-        print(f"Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
+        print(f"Добавлено {len(new_calls)} звонков наверх (ID={doc_id}).")
+
     except HttpError as e:
-        print("Ошибка при batchUpdate:", e)
+        msg = str(e)
+        if "Precondition check failed" in msg:
+            # fallback: вставляем в конец
+            requests_body = [{
+                "insertText": {"location": {"index": end_index}, "text": full_text}
+            }]
+            docs_service.documents().batchUpdate(
+                documentId=doc_id, body={"requests": requests_body}
+            ).execute()
+            print(f"Добавлено {len(new_calls)} звонков в конец (ID={doc_id}).")
+        else:
+            print("Ошибка при batchUpdate:", e)
+            return
+
+    # 8) Сохраняем отметку о последнем добавленном звонке
+    save_last_run(max_ts)
 
 if __name__ == "__main__":
     main()
