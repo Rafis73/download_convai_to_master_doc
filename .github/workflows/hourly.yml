@@ -1,9 +1,9 @@
 name: ConvAI → Google Docs
 
 on:
-  workflow_dispatch:      # ручной запуск
-  schedule:               # плановый запуск по cron
-    - cron: '* * * * *'   # каждую минуту по UTC
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   update-doc:
