@@ -1,122 +1,159 @@
+# download_convai_to_master_doc.py
 #!/usr/bin/env python3
-import os, time, datetime, sys, socket, requests, pickle
+
+import os
+import time
+import datetime
+import requests
+import pickle
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
-# ————— Глобальный таймаут —————
-socket.setdefaulttimeout(60)
-
-# ————— Настройки —————
-API_KEY       = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
-PAGE_SIZE     = 100
-MIN_DURATION  = 60      # сек
-SINCE_EPOCH   = int(datetime.datetime(2025,4,1).timestamp())
-DOC_ID        = os.getenv("MASTER_DOC_ID")
+# ----------------- НАСТРОЙКИ -----------------
+API_KEY      = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
+PAGE_SIZE    = 100
+MIN_DURATION = 60      # секунды
+SINCE        = int(datetime.datetime(2025, 4, 1, 0, 0).timestamp())
 LAST_RUN_FILE = "last_run.txt"
+CREDENTIALS  = "credentials.json"
+SCOPES       = [
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
+]
+TZ_OFFSET_HOURS = 4
 
-if not DOC_ID:
-    print("ERROR: MASTER_DOC_ID не задан!")
-    sys.exit(1)
-
-# ————— Google OAuth —————
-SCOPES = ["https://www.googleapis.com/auth/documents"]
-def get_creds():
+# ----------------- Google OAuth -----------------
+def get_credentials():
     creds = None
     if os.path.exists("token.pickle"):
-        creds = pickle.load(open("token.pickle","rb"))
+        with open("token.pickle", "rb") as f:
+            creds = pickle.load(f)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0, access_type="offline")
-        pickle.dump(creds, open("token.pickle","wb"))
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS, SCOPES
+            )
+            creds = flow.run_local_server(
+                port=0,
+                access_type="offline",
+                include_granted_scopes=True,
+            )
+        with open("token.pickle", "wb") as f:
+            pickle.dump(creds, f)
     return creds
 
-creds = get_creds()
-docs = build("docs","v1",credentials=creds)
+creds = get_credentials()
+docs_service = build("docs", "v1", credentials=creds)
 
-# ————— ConvAI API —————
-sess = requests.Session()
-sess.headers.update({"xi-api-key":API_KEY,"Accept":"application/json"})
-sess.trust_env = False
+# ----------------- ConvAI API -----------------
+session = requests.Session()
+session.headers.update({
+    "xi-api-key": API_KEY,
+    "Accept":     "application/json"
+})
 
 def fetch_all_calls():
-    out, url, params = [], "https://api.elevenlabs.io/v1/convai/conversations", {"page_size":PAGE_SIZE}
+    url = "https://api.elevenlabs.io/v1/convai/conversations"
+    params = {"page_size": PAGE_SIZE}
+    all_calls = []
     while True:
-        r = sess.get(url, params=params, timeout=30); r.raise_for_status()
-        j = r.json()
-        out += j.get("conversations",[])
-        if not j.get("has_more",False): break
-        params["cursor"] = j["next_cursor"]
-    return out
+        r = session.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        all_calls.extend(data.get("conversations", []))
+        if not data.get("has_more", False):
+            break
+        params["cursor"] = data.get("next_cursor")
+    return all_calls
 
-def fetch_detail(cid):
-    r = sess.get(f"https://api.elevenlabs.io/v1/convai/conversations/{cid}", timeout=30)
+def fetch_call_detail(conversation_id):
+    r = session.get(f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}")
     r.raise_for_status()
     return r.json()
 
-# ————— Работа с last_run —————
-def load_last():
-    if not os.path.exists(LAST_RUN_FILE):
-        return 0
-    return int(open(LAST_RUN_FILE).read().strip())
+# ----------------- Вспомогательные функции -----------------
+def load_last_run():
+    return int(open(LAST_RUN_FILE).read().strip()) if os.path.exists(LAST_RUN_FILE) else 0
 
-def save_last(ts):
-    open(LAST_RUN_FILE,"w").write(str(int(ts)))
+def save_last_run(timestamp):
+    with open(LAST_RUN_FILE, "w") as f:
+        f.write(str(int(timestamp)))
 
-# ————— Формат звонка —————
-def format_call(det, fallback):
-    st = det.get("metadata",{}).get("start_time_unix_secs",fallback)
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st))
-    summ = det.get("analysis",{}).get("transcript_summary","").strip()
-    lines, prev = [], None
-    for m in det.get("transcript",[]):
-        role = (m.get("role") or "").upper()
-        msg  = (m.get("message") or "").strip()
-        if not msg: continue
-        sec  = m.get("time_in_call_secs",0.0)
-        line = f"[{sec:06.2f}s] {role}: {msg}"
-        if prev and prev!=role: lines.append("")
-        if prev==role:
-            lines[-1] += "\n"+line
+# ----------------- Форматирование звонка -----------------
+def format_call(detail, fallback_ts):
+    st = detail.get("metadata", {}).get("start_time_unix_secs", fallback_ts)
+    adjusted_ts = st + (TZ_OFFSET_HOURS * 3600)
+    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(adjusted_ts))
+    summary = detail.get("analysis", {}).get("transcript_summary", "").strip()
+    transcript = detail.get("transcript", [])
+    lines = []
+    prev_role = None
+    for msg in transcript:
+        role = (msg.get("role") or "").upper()
+        text = (msg.get("message") or "").strip()
+        if not text:
+            continue
+        tsec = msg.get("time_in_call_secs", 0.0)
+        line = f"[{tsec:06.2f}s] {role}: {text}"
+        if prev_role and prev_role != role:
+            lines.append("")
+        if prev_role == role:
+            lines[-1] += "\n" + line
         else:
             lines.append(line)
-        prev = role
-    header = f"=== Call at {ts} ===\n"
-    if summ: header += f"Summary:\n{summ}\n"
-    return header + "\n" + "\n".join(lines) + "\n\n" + "―"*40 + "\n\n"
+        prev_role = role
+    header = f"=== Call at {ts_str} ===\n"
+    if summary:
+        header += f"Summary:\n{summary}\n"
+    return header + "\n" + "\n".join(lines) + "\n\n" + "―" * 40 + "\n\n"
 
-# ————— Main —————
+# ----------------- Основной процесс -----------------
 def main():
-    last_ts = load_last()
+    doc_id = os.environ.get("MASTER_DOC_ID")
+    if not doc_id:
+        raise RuntimeError("MASTER_DOC_ID environment variable is not set")
+
     calls = fetch_all_calls()
-    sel   = [c for c in calls if c.get("start_time_unix_secs",0)>=SINCE_EPOCH and c.get("call_duration_secs",0)>MIN_DURATION]
-    new   = [c for c in sel if c["start_time_unix_secs"]>last_ts]
-    if not new:
-        print("🔍 Нет новых звонков.")
+    relevant_calls = [
+        c for c in calls
+        if c.get("start_time_unix_secs", 0) >= SINCE
+        and c.get("call_duration_secs", 0) > MIN_DURATION
+    ]
+
+    last_ts = load_last_run()
+    new_calls = [c for c in relevant_calls if c.get("start_time_unix_secs", 0) > last_ts]
+    if not new_calls:
+        print("Нет новых звонков для добавления.")
         return
 
-    new.sort(key=lambda x:x["start_time_unix_secs"])
-    full, max_ts = "", last_ts
-    for c in new:
-        det = fetch_detail(c["conversation_id"])
-        full += format_call(det, c["start_time_unix_secs"])
-        st = det.get("metadata",{}).get("start_time_unix_secs",0)
-        if st>max_ts: max_ts=st
+    new_calls.sort(key=lambda x: x["start_time_unix_secs"], reverse=True)
+    full_text = ""
+    max_ts = last_ts
+    for call in new_calls:
+        cid = call["conversation_id"]
+        fallback = call.get("start_time_unix_secs", 0)
+        detail = fetch_call_detail(cid)
+        block = format_call(detail, fallback)
+        full_text += block
+        call_ts = detail.get("metadata", {}).get("start_time_unix_secs", fallback)
+        if call_ts > max_ts:
+            max_ts = call_ts
 
-    # Append-only через endOfSegmentLocation
-    reqs = [{"insertText":{"endOfSegmentLocation":{},"text":full}}]
-    try:
-        docs.documents().batchUpdate(documentId=DOC_ID,body={"requests":reqs}).execute()
-    except HttpError as e:
-        print("❌ Ошибка при batchUpdate:", e)
-        sys.exit(1)
+    requests_body = []
+    requests_body.append({
+        "insertText": {
+            "location": {"index": 1},
+            "text": full_text
+        }
+    })
 
-    save_last(max_ts)
-    print(f"✅ Добавлено {len(new)} звонков, last_run={max_ts}")
+    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
 
-if __name__=="__main__":
+    save_last_run(max_ts)
+    print(f"Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
+
+if __name__ == "__main__":
     main()
