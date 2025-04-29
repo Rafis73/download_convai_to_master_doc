@@ -30,14 +30,15 @@ jobs:
         MASTER_DOC_ID: ${{ secrets.MASTER_DOC_ID }}
       run: python download_convai_to_master_doc.py
 
-    - name: Commit updated last_run.txt if changed
+       - name: Commit updated last_run.txt if changed
       run: |
+        git config user.name "github-actions"
+        git config user.email "actions@github.com"
+        git pull
         git add last_run.txt || true
         if git diff --cached --exit-code --quiet; then
           echo "No changes to commit."
         else
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
- git commit -m "Update last_run.txt after sync"
-          git push
-        )
+          git commit -m "chore: update last_run.txt [skip ci]"
+          git push origin main
+        fi
