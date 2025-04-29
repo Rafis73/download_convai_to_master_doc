@@ -1,9 +1,9 @@
 name: ConvAI → Google Docs
 
 on:
-  # запуск по расписанию (каждый час в 0 минут)
+  # запуск каждые 5 минут
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/5 * * * *'
   # ручной запуск из UI GitHub Actions
   workflow_dispatch:
 
