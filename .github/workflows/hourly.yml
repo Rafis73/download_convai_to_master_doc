@@ -1,0 +1,21 @@
+name: ConvAI → Google Docs
+
+on:
+  schedule:
+    # запустить каждый час, в 0-й минуте
+    - cron:  '0 * * * *'
+
+jobs:
+  update-doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Установить Python и зависимости
+        run: |
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install requests google-api-python-client google-auth google-auth-oauthlib
+      - name: Запустить скрипт
+        run: |
+          . venv/bin/activate
+          python3 download_convai_to_master_doc.py
