@@ -1,16 +1,18 @@
 name: ConvAI → Google Docs
 
 on:
-  workflow_dispatch:      # ручной триггер (через кнопку Run workflow)
-  schedule:               # плановый триггер
+  workflow_dispatch:      # ручной запуск
+  schedule:               # плановый запуск по cron
     - cron: '* * * * *'   # каждую минуту по UTC
 
 jobs:
   update-doc:
     runs-on: ubuntu-latest
+
     env:
       MASTER_DOC_ID: ${{ secrets.MASTER_DOC_ID }}
       TZ_OFFSET_HOURS: ${{ secrets.TZ_OFFSET_HOURS }}
+
     steps:
       - uses: actions/checkout@v3
 
