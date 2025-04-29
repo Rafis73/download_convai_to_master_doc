@@ -30,7 +30,7 @@ jobs:
         MASTER_DOC_ID: ${{ secrets.MASTER_DOC_ID }}
       run: python download_convai_to_master_doc.py
 
-       - name: Commit updated last_run.txt if changed
+    - name: Commit updated last_run.txt if changed
       run: |
         git config user.name "github-actions"
         git config user.email "actions@github.com"
