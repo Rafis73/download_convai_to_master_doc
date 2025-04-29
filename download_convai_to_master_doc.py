@@ -3,9 +3,9 @@
 
 import os
 import time
-import datetime
 import requests
 import pickle
+from datetime import datetime, timedelta
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -14,8 +14,7 @@ from googleapiclient.discovery import build
 API_KEY       = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
 PAGE_SIZE     = 100
 MIN_DURATION  = 60      # секунды
-# С какого момента брать звонки (1 апреля 2025)
-SINCE         = int(datetime.datetime(2025, 4, 1, 0, 0).timestamp())
+SINCE         = int(datetime(2025, 4, 1, 0, 0).timestamp())
 DOC_ID_FILE   = "doc_id.txt"
 LAST_RUN_FILE = "last_run.txt"
 CREDENTIALS   = "credentials.json"
@@ -23,6 +22,10 @@ SCOPES        = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
 ]
+
+# Смещение вашего часового пояса относительно UTC, часы
+# Можно переопределить через переменную окружения TZ_OFFSET_HOURS
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "4"))
 
 # ----------------- Google OAuth -----------------
 def get_credentials():
@@ -86,9 +89,17 @@ def save_last_run(ts):
         f.write(str(int(ts)))
 
 def load_doc_id():
+    # Сначала пробуем взять из переменной окружения (GitHub Secrets)
+    env = os.getenv("MASTER_DOC_ID")
+    if env:
+        return env
+    # Иначе – из локального файла
     return open(DOC_ID_FILE).read().strip() if os.path.exists(DOC_ID_FILE) else None
 
 def save_doc_id(did):
+    # Если используем переменную окружения, файл не обновляем
+    if os.getenv("MASTER_DOC_ID"):
+        return
     with open(DOC_ID_FILE, "w") as f:
         f.write(did)
 
@@ -102,8 +113,11 @@ def create_master_doc():
 
 # ----------------- Формат звонка -----------------
 def format_call(detail, fallback_ts):
+    # исходный UNIX-тайм звонка (UTC)
     st = detail.get("metadata", {}).get("start_time_unix_secs", fallback_ts)
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st))
+    # преобразуем в ваш часовой пояс
+    dt = datetime.utcfromtimestamp(st) + timedelta(hours=TZ_OFFSET_HOURS)
+    ts = dt.strftime("%Y-%m-%d %H:%M:%S")
     summ = detail.get("analysis", {}).get("transcript_summary", "").strip()
     transcript = detail.get("transcript", [])
     lines = []
@@ -116,7 +130,7 @@ def format_call(detail, fallback_ts):
         tsec = m.get("time_in_call_secs", 0.0)
         line = f"[{tsec:06.2f}s] {role}: {txt}"
         if prev and prev != role:
-            lines.append("")  # разделитель
+            lines.append("")  # разделитель между ролями
         if prev == role:
             lines[-1] += "\n" + line
         else:
@@ -126,18 +140,18 @@ def format_call(detail, fallback_ts):
     header = f"=== Call at {ts} ===\n"
     if summ:
         header += f"Summary:\n{summ}\n"
-    return header + "\n" + body + "\n\n" + "―"*40 + "\n\n"
+    return header + "\n" + body + "\n\n" + "―" * 40 + "\n\n"
 
 # ----------------- Основной Flow -----------------
 def main():
-    # 1) master-doc
+    # 1) получаем ID документа (или создаём новый, если нет)
     doc_id = load_doc_id() or create_master_doc()
     save_doc_id(doc_id)
 
-    # 2) загрузка всех звонков
+    # 2) загружаем все звонки
     calls = fetch_all_calls()
 
-    # 3) фильтрация: с 1 апреля 2025 и дольше 1 минуты
+    # 3) фильтруем: с заданной даты и минимум по длительности
     sel = [
         c for c in calls
         if c.get("start_time_unix_secs", 0) >= SINCE
@@ -146,20 +160,15 @@ def main():
 
     # 4) только новые после last_run
     last_ts = load_last_run()
-    new_calls = [
-        c for c in sel
-        if c.get("start_time_unix_secs", 0) > last_ts
-    ]
+    new_calls = [c for c in sel if c.get("start_time_unix_secs", 0) > last_ts]
     if not new_calls:
         print("Нет новых звонков для добавления.")
         return
 
-    # 5) сортировка (последний звонок первым)
-    new_calls.sort(
-        key=lambda x: x["start_time_unix_secs"], reverse=True
-    )
+    # 5) сортируем: самые свежие первыми
+    new_calls.sort(key=lambda x: x["start_time_unix_secs"], reverse=True)
 
-    # 6) формируем full_text, отслеживаем max_ts
+    # 6) собираем тело вставки и вычисляем max_ts
     full_text = ""
     max_ts = last_ts
     for c in new_calls:
@@ -172,14 +181,14 @@ def main():
         if st_call > max_ts:
             max_ts = st_call
 
-    # 7) вставка и раскраска
-    requests_body = []
-    requests_body.append({
+    # 7) вставляем текст и раскрашиваем роли
+    requests_body = [{
         "insertText": {
             "location": {"index": 1},
             "text": full_text
         }
-    })
+    }]
+
     offset = 1
     pos = 0
     color_map = {
@@ -212,7 +221,7 @@ def main():
         body={"requests": requests_body}
     ).execute()
 
-    # 8) сохранение last_run
+    # 8) сохраняем отметку о последнем запуске
     save_last_run(max_ts)
     print(f"Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
 
