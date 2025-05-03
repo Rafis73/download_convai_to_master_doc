@@ -22,6 +22,7 @@ SCOPES       = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 TZ_OFFSET_HOURS = 4
+AGENT_NAME_FILTER = "LeiaAGI"
 
 # ----------------- Google OAuth -----------------
 def get_credentials():
@@ -63,7 +64,10 @@ def fetch_all_calls():
         r = session.get(url, params=params)
         r.raise_for_status()
         data = r.json()
-        all_calls.extend(data.get("conversations", []))
+        calls = data.get("conversations", [])
+        for call in calls:
+            if call.get("agent", "") == AGENT_NAME_FILTER:
+                all_calls.append(call)
         if not data.get("has_more", False):
             break
         params["cursor"] = data.get("next_cursor")
