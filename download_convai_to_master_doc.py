@@ -12,7 +12,7 @@ from googleapiclient.discovery import build
 # ----------------- НАСТРОЙКИ -----------------
 API_KEY      = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
 PAGE_SIZE    = 100
-MIN_DURATION = 60
+MIN_DURATION = 60      # секунды
 SINCE        = int(datetime.datetime(2025, 4, 1, 0, 0).timestamp())
 LAST_RUN_FILE = "last_run.txt"
 CREDENTIALS  = "credentials.json"
@@ -33,8 +33,14 @@ def get_credentials():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
-            creds = flow.run_local_server(port=0, access_type="offline", include_granted_scopes=True)
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS, SCOPES
+            )
+            creds = flow.run_local_server(
+                port=0,
+                access_type="offline",
+                include_granted_scopes=True,
+            )
         with open("token.pickle", "wb") as f:
             pickle.dump(creds, f)
     return creds
@@ -59,7 +65,7 @@ def fetch_all_calls():
         data = r.json()
         calls = data.get("conversations", [])
         for call in calls:
-            if call.get("agent", "") == AGENT_NAME_FILTER:
+            if call.get("agent_name", "") == AGENT_NAME_FILTER:
                 all_calls.append(call)
         if not data.get("has_more", False):
             break
@@ -126,7 +132,6 @@ def main():
     last_ts = load_last_run()
     new_calls = [c for c in relevant_calls if c.get("start_time_unix_secs", 0) > last_ts]
     print(f"Новых звонков: {len(new_calls)}")
-
     if not new_calls:
         print("Нет новых звонков для добавления.")
         return
@@ -152,8 +157,9 @@ def main():
     }]
 
     docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
+
     save_last_run(max_ts)
-    print(f"✅ Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
+    print(f"Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
 
 if __name__ == "__main__":
     main()
