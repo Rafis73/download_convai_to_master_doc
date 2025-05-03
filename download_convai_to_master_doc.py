@@ -1,4 +1,3 @@
-# download_convai_to_master_doc.py
 #!/usr/bin/env python3
 
 import os
@@ -13,7 +12,7 @@ from googleapiclient.discovery import build
 # ----------------- НАСТРОЙКИ -----------------
 API_KEY      = "sk_91b455debc341646af393b6582573e06c70458ce8c0e51d4"
 PAGE_SIZE    = 100
-MIN_DURATION = 60      # секунды
+MIN_DURATION = 60
 SINCE        = int(datetime.datetime(2025, 4, 1, 0, 0).timestamp())
 LAST_RUN_FILE = "last_run.txt"
 CREDENTIALS  = "credentials.json"
@@ -34,14 +33,8 @@ def get_credentials():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS, SCOPES
-            )
-            creds = flow.run_local_server(
-                port=0,
-                access_type="offline",
-                include_granted_scopes=True,
-            )
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
+            creds = flow.run_local_server(port=0, access_type="offline", include_granted_scopes=True)
         with open("token.pickle", "wb") as f:
             pickle.dump(creds, f)
     return creds
@@ -121,14 +114,19 @@ def main():
         raise RuntimeError("MASTER_DOC_ID environment variable is not set")
 
     calls = fetch_all_calls()
+    print(f"Всего звонков от агента {AGENT_NAME_FILTER}: {len(calls)}")
+
     relevant_calls = [
         c for c in calls
         if c.get("start_time_unix_secs", 0) >= SINCE
         and c.get("call_duration_secs", 0) > MIN_DURATION
     ]
+    print(f"После фильтра по дате и длительности: {len(relevant_calls)}")
 
     last_ts = load_last_run()
     new_calls = [c for c in relevant_calls if c.get("start_time_unix_secs", 0) > last_ts]
+    print(f"Новых звонков: {len(new_calls)}")
+
     if not new_calls:
         print("Нет новых звонков для добавления.")
         return
@@ -146,18 +144,16 @@ def main():
         if call_ts > max_ts:
             max_ts = call_ts
 
-    requests_body = []
-    requests_body.append({
+    requests_body = [{
         "insertText": {
             "location": {"index": 1},
             "text": full_text
         }
-    })
+    }]
 
     docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests_body}).execute()
-
     save_last_run(max_ts)
-    print(f"Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
+    print(f"✅ Добавлено {len(new_calls)} звонков в Google Doc (ID={doc_id}).")
 
 if __name__ == "__main__":
     main()
